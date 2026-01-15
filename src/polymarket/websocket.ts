@@ -21,7 +21,6 @@ export class PolymarketWebSocket {
     // Store latest data - keyed by assetId
     private latestBookByAssetId: Map<string, { bestBid: string, bestAsk: string }> = new Map();
     private latestPriceChanges: PriceChange[] = [];
-    private readonly TARGET_ADDRESS = config.wallet.wallet1;
 
     /**
      * Connect to the WebSocket and subscribe to a market

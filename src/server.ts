@@ -47,20 +47,27 @@ async function startServer() {
   try {
 
     const server = app.listen(config.server.port, config.server.host, async () => {
-      logger.info(`🌟 Crypto Monitoring Bot API running on port ${config.server.port}`);
+      logger.info(`🌟 Trading Bot API running on port ${config.server.port}`);
 
+      // Initialize Binance WebSocket
+      logger.info('🔌 Connecting to Binance WebSocket...');
       const binanceWebSocket = new BinanceWebSocket();
 
+      // Wait for initial data
+      logger.info('⏳ Waiting for initial market data...');
       await new Promise(resolve => setTimeout(resolve, 5000));
 
+      // Initialize Polymarket Client
+      logger.info('🔌 Initializing Polymarket Client...');
       const polymarketClient = new PolymarketClient(binanceWebSocket);
-      const client = polymarketClient.getClient();
+
 
     });
 
     // Graceful shutdown
     const shutdown = () => {
       logger.info('Shutdown signal received, shutting down gracefully');
+
       server.close(() => {
         logger.info('Process terminated');
         process.exit(0);
