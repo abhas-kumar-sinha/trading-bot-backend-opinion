@@ -87,6 +87,27 @@ export class BinanceWebSocketDataProvider {
     console.log('✅ Binance WebSocket Data Provider started');
   }
 
+  /**
+   * Wait for WebSocket connection to be established
+   */
+  async waitForConnection(timeoutMs: number = 30000): Promise<boolean> {
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeoutMs) {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        console.log('✅ Binance WebSocket connection confirmed');
+        return true;
+      }
+
+      // Wait 100ms before checking again
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    console.error('❌ Binance WebSocket connection timeout');
+    return false;
+  }
+
+
   private async fetchInitialData(): Promise<void> {
     console.log('📥 Fetching initial market data...');
 

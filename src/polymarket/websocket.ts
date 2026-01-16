@@ -8,8 +8,7 @@ type PolymarketMessage = BookMessage | PriceChangeMessage;
 export class PolymarketWebSocket {
     private ws: WebSocket | null = null;
     private readonly wsUrl = config.polymarket.wsUrl;
-    private currentAssetId1: string | null = null;
-    private currentAssetId2: string | null = null;
+    private subscribedAssets: Set<string> = new Set();
     private reconnectAttempts = 0;
     private readonly maxReconnectAttempts = 5;
     private readonly reconnectDelay = 5000; // 5 seconds
@@ -23,36 +22,55 @@ export class PolymarketWebSocket {
     private latestPriceChanges: PriceChange[] = [];
 
     /**
-     * Connect to the WebSocket and subscribe to a market
+     * Connect to the WebSocket
      */
     public connect(assetId1: string, assetId2: string): void {
+        // Add new assets to subscription list
+        this.subscribedAssets.add(assetId1);
+        this.subscribedAssets.add(assetId2);
+
+        // If already connected, just subscribe to new assets
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.subscribe([assetId1, assetId2]);
+            return;
+        }
+
+        // If connection is in progress, wait for it to complete
         if (this.isConnecting) {
-            console.log('Connection already in progress, waiting...');
+            console.log('Connection already in progress, assets will be subscribed when ready');
             return;
         }
 
-        if (this.currentAssetId1 === assetId1 && this.ws?.readyState === WebSocket.OPEN) {
-            console.log(`Already connected to asset ${assetId1}`);
+        // If not connected, establish connection
+        if (!this.ws) {
+            this.establishConnection();
+        }
+
+    }
+
+    /**
+     * Establish WebSocket connection
+     */
+    private establishConnection(): void {
+        if (this.isConnecting) {
             return;
         }
 
-        // If changing markets, close existing connection first
-        if (this.ws) {
-            this.cleanup();
-        }
-
-        this.currentAssetId1 = assetId1;
-        this.currentAssetId2 = assetId2;
         this.isConnecting = true;
 
         try {
             this.ws = new WebSocket(this.wsUrl);
 
             this.ws.on('open', () => {
-                console.log('Polymarket WebSocket connected');
+                console.log('✅ Polymarket WebSocket connected');
                 this.isConnecting = false;
                 this.reconnectAttempts = 0;
-                this.subscribe(assetId1, assetId2);
+
+                // Subscribe to all assets in the set
+                if (this.subscribedAssets.size > 0) {
+                    this.subscribe(Array.from(this.subscribedAssets));
+                }
+
                 this.startPingInterval();
             });
 
@@ -61,13 +79,13 @@ export class PolymarketWebSocket {
             });
 
             this.ws.on('close', (code: number, reason: string) => {
-                console.log(`Polymarket WebSocket closed: ${code} - ${reason}`);
+                console.log(`⚠️ Polymarket WebSocket closed: ${code} - ${reason}`);
                 this.isConnecting = false;
                 this.handleClose();
             });
 
             this.ws.on('error', (error: Error) => {
-                console.error('Polymarket WebSocket error:', error);
+                console.error('❌ Polymarket WebSocket error:', error);
                 this.isConnecting = false;
             });
 
@@ -82,20 +100,20 @@ export class PolymarketWebSocket {
     }
 
     /**
-     * Subscribe to market data for a specific asset
+     * Subscribe to market data for specific assets
      */
-    private subscribe(assetId1: string, assetId2: string): void {
+    private subscribe(assetIds: string[]): void {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             console.error('Cannot subscribe: WebSocket not connected');
             return;
         }
 
         const subscriptionMessage = {
-            assets_ids: [assetId1, assetId2],
+            assets_ids: assetIds,
             type: 'market'
         };
 
-        console.log('Sending subscription message:', subscriptionMessage);
+        console.log('📡 Subscribing to assets:', assetIds);
         this.ws.send(JSON.stringify(subscriptionMessage));
     }
 
@@ -106,7 +124,14 @@ export class PolymarketWebSocket {
         this.lastMessageTime = Date.now();
 
         try {
-            const message: PolymarketMessage = JSON.parse(data.toString());
+            const text = data.toString();
+
+            // Polymarket sometimes sends plain text errors
+            if (!text.startsWith("{")) {
+                return;
+            }
+
+            const message: PolymarketMessage = JSON.parse(text);
 
             switch (message.event_type) {
                 case 'book':
@@ -136,7 +161,6 @@ export class PolymarketWebSocket {
             bestBid,
             bestAsk
         });
-
     }
 
     /**
@@ -172,15 +196,13 @@ export class PolymarketWebSocket {
     private handleClose(): void {
         this.cleanup();
 
-        // Attempt reconnection if we have a current asset ID
-        if (this.currentAssetId1 && this.reconnectAttempts < this.maxReconnectAttempts) {
+        // Attempt reconnection if we have subscribed assets
+        if (this.subscribedAssets.size > 0 && this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
             console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
 
             setTimeout(() => {
-                if (this.currentAssetId1) {
-                    this.connect(this.currentAssetId1, this.currentAssetId2);
-                }
+                this.establishConnection();
             }, this.reconnectDelay);
         } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
             console.error('Max reconnection attempts reached');
@@ -227,10 +249,10 @@ export class PolymarketWebSocket {
     }
 
     /**
-     * Get the current asset ID
+     * Get all subscribed asset IDs
      */
-    public getCurrentAssetIds(): string[] {
-        return [this.currentAssetId1, this.currentAssetId2];
+    public getSubscribedAssets(): string[] {
+        return Array.from(this.subscribedAssets);
     }
 
     /**
@@ -245,8 +267,7 @@ export class PolymarketWebSocket {
      */
     public disconnect(): void {
         console.log('Disconnecting Polymarket WebSocket');
-        this.currentAssetId1 = null;
-        this.currentAssetId2 = null;
+        this.subscribedAssets.clear();
         this.reconnectAttempts = this.maxReconnectAttempts;
         this.cleanup();
     }

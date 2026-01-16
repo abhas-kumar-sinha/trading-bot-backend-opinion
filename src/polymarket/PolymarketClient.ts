@@ -5,21 +5,19 @@
 import { ClobClient, Chain, Side } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 import axios from 'axios';
-import WebSocket from 'ws';
 import { OrderBookData, PolymarketMarket } from '../types';
 import { BotConfig } from '../config';
+import { PolymarketWebSocket } from './websocket';
 
 export class PolymarketClient {
   private clobClient: ClobClient;
   private gammaApiUrl: string;
-  private ws: WebSocket | null = null;
-  private wsUrl: string;
-  private orderBooks: Map<string, OrderBookData> = new Map();
-  private subscribedAssets: Set<string> = new Set();
+  private ws: PolymarketWebSocket;
+  private marketAssetIds: Map<string, { assetId1: string; assetId2: string }> = new Map();
 
   constructor(config: BotConfig) {
     const wallet = new Wallet(config.polymarket.privateKey);
-    
+
     this.clobClient = new ClobClient(
       config.polymarket.host,
       Chain.POLYGON,
@@ -32,107 +30,52 @@ export class PolymarketClient {
     );
 
     this.gammaApiUrl = config.polymarket.gammaApiUrl;
-    this.wsUrl = config.polymarket.wsUrl;
+    this.ws = new PolymarketWebSocket();
   }
 
   async start(): Promise<void> {
     console.log('🔗 Connecting to Polymarket...');
-    this.connectWebSocket();
     console.log('✅ Polymarket client started');
   }
 
-  private connectWebSocket(): void {
-    this.ws = new WebSocket(this.wsUrl);
+  /**
+   * Subscribe to order books for a specific market's asset IDs
+   */
+  subscribeToMarket(coin: string, assetId1: string, assetId2: string): void {
+    console.log(`📡 Subscribing to ${coin} market: ${assetId1}, ${assetId2}`);
 
-    this.ws.on('open', () => {
-      console.log('✅ Polymarket WebSocket connected');
-      this.resubscribeAll();
-    });
+    // Store the asset IDs for this coin
+    this.marketAssetIds.set(coin, { assetId1, assetId2 });
 
-    this.ws.on('message', (data: WebSocket.Data) => {
-      this.handleMessage(data);
-    });
-
-    this.ws.on('error', (error: Error) => {
-      console.error('❌ Polymarket WS error:', error);
-    });
-
-    this.ws.on('close', () => {
-      console.log('⚠️ Polymarket WS closed, reconnecting...');
-      setTimeout(() => this.connectWebSocket(), 5000);
-    });
+    // Connect WebSocket with both asset IDs
+    this.ws.connect(assetId1, assetId2);
   }
 
-  private resubscribeAll(): void {
-    if (this.subscribedAssets.size > 0) {
-      const assets = Array.from(this.subscribedAssets);
-      this.subscribedAssets.clear();
-      this.subscribeToOrderBooks(assets);
-    }
+  /**
+   * Subscribe to order books for a pair of asset IDs (2 at a time)
+   */
+  subscribeToOrderBooks(assetId1: string, assetId2: string): void {
+    console.log(`📡 Subscribing to Polymarket pair: [${assetId1}, ${assetId2}]`);
+
+    // Connect WebSocket with both asset IDs
+    this.ws.connect(assetId1, assetId2);
   }
 
-  private handleMessage(data: WebSocket.Data): void {
-    try {
-      const text = data.toString();
+  /**
+   * Subscribe to multiple markets in pairs
+   * Each market has 2 asset IDs (UP and DOWN tokens)
+   */
+  subscribeInPairs(marketAssetPairs: Array<{ assetId1: string; assetId2: string; coin: string }>): void {
+    console.log(`📡 Subscribing to ${marketAssetPairs.length} Polymarket market pairs...`);
 
-      // Polymarket sometimes sends plain text errors
-      if (!text.startsWith("{")) {
-          return;
-      }
-
-      let msg: any;
-      try {
-          msg = JSON.parse(text);
-      } catch (err) {
-          console.error("❌ Failed to parse Polymarket JSON:", text);
-          return;
-      }
-
-      if (msg.event_type === 'book') {
-        const bids = msg.bids?.map((b: any) => ({ 
-          price: parseFloat(b.price), 
-          size: parseFloat(b.size) 
-        })) || [];
-        const asks = msg.asks?.map((a: any) => ({ 
-          price: parseFloat(a.price), 
-          size: parseFloat(a.size) 
-        })) || [];
-
-        const bestBid = bids[bids.length - 1]?.price || 0;
-        const bestAsk = asks[asks.length - 1]?.price || 1;
-
-        this.orderBooks.set(msg.asset_id, {
-          assetId: msg.asset_id,
-          bids,
-          asks,
-          bestBid,
-          bestAsk,
-          spread: bestAsk - bestBid,
-          mid: (bestBid + bestAsk) / 2,
-        });
-      }
-    } catch (error) {
-      console.error('Error parsing Polymarket message:', error);
-    }
-  }
-
-  subscribeToOrderBooks(assetIds: string[]): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      setTimeout(() => this.subscribeToOrderBooks(assetIds), 1000);
-      return;
+    for (const pair of marketAssetPairs) {
+      console.log(`   - ${pair.coin}: [${pair.assetId1}, ${pair.assetId2}]`);
+      this.ws.connect(pair.assetId1, pair.assetId2);
     }
 
-    const newAssets = assetIds.filter(id => !this.subscribedAssets.has(id));
-    if (newAssets.length === 0) return;
-
-    this.ws.send(JSON.stringify({
-      assets_ids: newAssets,
-      type: 'market',
-    }));
-
-    newAssets.forEach(id => this.subscribedAssets.add(id));
-    console.log(`📡 Subscribed to ${newAssets.length} Polymarket assets`);
+    console.log(`✅ Subscribed to ${marketAssetPairs.length} market pairs`);
   }
+
 
   async fetchMarket(slugPrefix: string): Promise<PolymarketMarket | null> {
     try {
@@ -207,15 +150,32 @@ export class PolymarketClient {
     }
   }
 
+  /**
+   * Get order book data for a specific asset ID
+   */
   getOrderBook(assetId: string): OrderBookData | null {
-    return this.orderBooks.get(assetId) || null;
+    const bookData = this.ws.getLatestBookByAssetId(assetId);
+
+    if (!bookData) {
+      return null;
+    }
+
+    const bestBid = parseFloat(bookData.bestBid);
+    const bestAsk = parseFloat(bookData.bestAsk);
+
+    return {
+      assetId,
+      bids: [{ price: bestBid, size: 0 }],
+      asks: [{ price: bestAsk, size: 0 }],
+      bestBid,
+      bestAsk,
+      spread: bestAsk - bestBid,
+      mid: (bestBid + bestAsk) / 2,
+    };
   }
 
   stop(): void {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    this.ws.disconnect();
     console.log('✅ Polymarket client stopped');
   }
 }

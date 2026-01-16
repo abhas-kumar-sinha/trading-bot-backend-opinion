@@ -16,7 +16,7 @@ export class TradingBot {
   private polymarket: PolymarketClient;
   private rebalancingEngine: RebalancingEngine;
   private db: DatabaseClient;
-  
+
   private activeSessions: Map<string, MarketSession> = new Map();
   private rebalanceTimers: Map<string, NodeJS.Timeout> = new Map();
   private running: boolean = false;
@@ -38,26 +38,164 @@ export class TradingBot {
       throw new Error('Database connection failed');
     }
 
+    // STEP 1: Subscribe to Binance WebSocket for market feed
+    console.log('📊 Step 1: Subscribing to Binance WebSocket...');
     await this.dataProvider.start(this.config.coins);
+
+    // STEP 2: Wait for Binance connection confirmation
+    console.log('⏳ Step 2: Waiting for Binance WebSocket connection...');
+    const binanceConnected = await this.dataProvider.waitForConnection();
+    if (!binanceConnected) {
+      throw new Error('Failed to connect to Binance WebSocket');
+    }
+
+    // Start Polymarket client
     await this.polymarket.start();
-    
+
     this.running = true;
 
-    // Start market discovery and monitoring
-    await this.discoverActiveMarkets();
-    this.startMarketDiscoveryLoop();
+    // STEP 3-6: Discover markets, subscribe to Polymarket, and start trading
+    await this.initializeMarketsAndTrading();
 
     console.log('\n✅ Bot is running\n');
   }
 
   /**
+   * Initialize markets and start trading workflow
+   * Steps 3-6: Fetch markets → Extract IDs → Subscribe in pairs → Start trading
+   */
+  private async initializeMarketsAndTrading(): Promise<void> {
+    console.log('🔍 Step 3: Fetching active markets from Polymarket...');
+
+    const marketPairs: Array<{ coin: string; market: PolymarketMarket; assetId1: string; assetId2: string; endTime: number }> = [];
+
+    // Fetch all active markets
+    for (const coin of this.config.coins.filter(c => c.enabled)) {
+      const market = await this.polymarket.fetchMarket(coin.polymarketSlug);
+
+      if (market && market.active) {
+        const endTime = this.parseMarketEndTime(market.slug);
+
+        if (!endTime) {
+          console.log(`⚠️ ${coin.symbol}: Could not parse end time from slug: ${market.slug}`);
+          continue;
+        }
+
+        const now = Date.now();
+        const timeUntilEnd = endTime - now;
+
+        // Only process markets that end within the next 2 hours
+        if (timeUntilEnd > 0 && timeUntilEnd < 7200000) {
+          const assetIds = JSON.parse(market.clobTokenIds);
+          const [assetId1, assetId2] = assetIds;
+
+          marketPairs.push({
+            coin: coin.symbol,
+            market,
+            assetId1,
+            assetId2,
+            endTime
+          });
+
+          console.log(`✅ ${coin.symbol}: ${market.question}`);
+          console.log(`   Ends at: ${new Date(endTime).toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`);
+          console.log(`   Asset IDs: [${assetId1}, ${assetId2}]`);
+        }
+      }
+    }
+
+    if (marketPairs.length === 0) {
+      console.log('⚠️ No active markets found');
+      return;
+    }
+
+    console.log(`\n📊 Step 4: Extracted ${marketPairs.length * 2} CLOB asset IDs from ${marketPairs.length} markets`);
+
+    // STEP 5: Subscribe to Polymarket WebSocket in pairs (2 IDs at a time)
+    console.log('\n📡 Step 5: Subscribing to Polymarket WebSocket in pairs...');
+    this.polymarket.subscribeInPairs(marketPairs.map(mp => ({
+      coin: mp.coin,
+      assetId1: mp.assetId1,
+      assetId2: mp.assetId2
+    })));
+
+    // Wait for orderbook data
+    await this.sleep(2000);
+
+    // STEP 6: Start trading
+    console.log('\n🎯 Step 6: Starting trading logic...');
+
+    for (const { coin, market, endTime } of marketPairs) {
+      const coinConfig = this.config.coins.find(c => c.symbol === coin);
+      if (!coinConfig) continue;
+
+      const session: MarketSession = {
+        coin,
+        market,
+        startTime: Date.now(),
+        endTime,
+        active: true,
+      };
+
+      this.activeSessions.set(coin, session);
+
+      // Check if we already have an open position for this market
+      const existingPosition = await this.db.getActivePositionForMarket(coin, market.slug);
+
+      if (existingPosition) {
+        console.log(`   📍 ${coin}: Resuming existing position: ${existingPosition.id}`);
+        session.positionId = existingPosition.id;
+        this.startRebalancing(existingPosition, session);
+      } else {
+        await this.enterInitialPositionWithRetry(coinConfig, session);
+      }
+    }
+
+    // Schedule market refresh 5 minutes before the earliest market ends
+    if (marketPairs.length > 0) {
+      const earliestEndTime = Math.min(...marketPairs.map(mp => mp.endTime));
+      this.scheduleMarketRefresh(earliestEndTime);
+    }
+  }
+
+  /**
+   * Schedule market refresh to run 5 minutes before market ends
+   */
+  private scheduleMarketRefresh(marketEndTime: number): void {
+    const refreshTime = marketEndTime - (5 * 60 * 1000); // 5 minutes before end
+    const now = Date.now();
+    const delay = refreshTime - now;
+
+    if (delay <= 0) {
+      console.log('⚠️ Market end time already passed or too close, skipping refresh schedule');
+      return;
+    }
+
+    const endTimeStr = new Date(marketEndTime).toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const refreshTimeStr = new Date(refreshTime).toLocaleString('en-US', { timeZone: 'America/New_York' });
+
+    console.log(`\n⏰ Market refresh scheduled:`);
+    console.log(`   Market ends: ${endTimeStr} ET`);
+    console.log(`   Refresh at: ${refreshTimeStr} ET (5 minutes before)`);
+    console.log(`   Time until refresh: ${Math.floor(delay / 60000)} minutes`);
+
+    setTimeout(async () => {
+      if (!this.running) return;
+
+      console.log('\n🔄 Market refresh triggered - fetching new active markets...');
+      await this.initializeMarketsAndTrading();
+    }, delay);
+  }
+
+  /**
    * Parse market slug to determine end time in ET
    */
+
   private parseMarketEndTime(slug: string): number | null {
     try {
       // Example: bitcoin-up-or-down-january-16-6am-et
       const parts = slug.split('-');
-      
+
       // Find the month, day, and time
       let month: string | null = null;
       let day: number | null = null;
@@ -66,10 +204,10 @@ export class TradingBot {
 
       for (let i = 0; i < parts.length; i++) {
         const part = parts[i].toLowerCase();
-        
+
         // Check for month names
-        const months = ['january', 'february', 'march', 'april', 'may', 'june', 
-                       'july', 'august', 'september', 'october', 'november', 'december'];
+        const months = ['january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december'];
         if (months.includes(part)) {
           month = part;
           if (i + 1 < parts.length && !isNaN(parseInt(parts[i + 1]))) {
@@ -97,8 +235,8 @@ export class TradingBot {
       // Build the end time in ET
       const year = new Date().getFullYear();
       const monthIndex = ['january', 'february', 'march', 'april', 'may', 'june',
-                         'july', 'august', 'september', 'october', 'november', 'december']
-                         .indexOf(month);
+        'july', 'august', 'september', 'october', 'november', 'december']
+        .indexOf(month);
 
       const endTime = DateTime.fromObject({
         year,
@@ -117,90 +255,6 @@ export class TradingBot {
   }
 
   /**
-   * Discover currently active markets
-   */
-  private async discoverActiveMarkets(): Promise<void> {
-    console.log('🔍 Discovering active markets...');
-
-    for (const coin of this.config.coins.filter(c => c.enabled)) {
-      const market = await this.polymarket.fetchMarket(coin.polymarketSlug);
-      
-      if (market && market.active) {
-        const endTime = this.parseMarketEndTime(market.slug);
-        
-        if (!endTime) {
-          console.log(`⚠️ ${coin.symbol}: Could not parse end time from slug: ${market.slug}`);
-          continue;
-        }
-
-        const now = Date.now();
-        const timeUntilEnd = endTime - now;
-
-        // Only process markets that end within the next 2 hours
-        if (timeUntilEnd > 0 && timeUntilEnd < 7200000) {
-          const assetIds = JSON.parse(market.clobTokenIds);
-          this.polymarket.subscribeToOrderBooks(assetIds);
-
-          const session: MarketSession = {
-            coin: coin.symbol,
-            market,
-            startTime: now,
-            endTime,
-            active: true,
-          };
-
-          this.activeSessions.set(coin.symbol, session);
-
-          console.log(`✅ ${coin.symbol}: ${market.question}`);
-          console.log(`   Ends at: ${new Date(endTime).toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`);
-          console.log(`   Time remaining: ${Math.floor(timeUntilEnd / 60000)} minutes`);
-
-          // Check if we already have an open position for this market
-          const existingPosition = await this.db.getActivePositionForMarket(coin.symbol, market.slug);
-          
-          if (existingPosition) {
-            console.log(`   📍 Resuming existing position: ${existingPosition.id}`);
-            session.positionId = existingPosition.id;
-            this.startRebalancing(existingPosition, session);
-          } else {
-            // Wait for orderbook data before entering
-            await this.sleep(2000);
-            await this.enterInitialPositionWithRetry(coin, session);
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Continuously discover new markets
-   */
-  private startMarketDiscoveryLoop(): void {
-    setInterval(async () => {
-      if (!this.running) return;
-
-      for (const coin of this.config.coins.filter(c => c.enabled)) {
-        const existingSession = this.activeSessions.get(coin.symbol);
-        
-        // Skip if we already have an active session
-        if (existingSession && existingSession.active) continue;
-
-        const market = await this.polymarket.fetchMarket(coin.polymarketSlug);
-        
-        if (market && market.active) {
-          const endTime = this.parseMarketEndTime(market.slug);
-          
-          if (endTime && endTime > Date.now()) {
-            console.log(`\n🆕 New market discovered for ${coin.symbol}`);
-            await this.discoverActiveMarkets();
-            break;
-          }
-        }
-      }
-    }, 60000); // Check every minute
-  }
-
-  /**
    * Enter initial position with retry logic
    */
   private async enterInitialPositionWithRetry(
@@ -213,17 +267,17 @@ export class TradingBot {
 
     while (attempt < maxRetries && !success && this.running) {
       attempt++;
-      
+
       try {
         console.log(`\n🎯 Attempting to enter position for ${coin.symbol} (Attempt ${attempt}/${maxRetries})`);
-        
+
         await this.enterInitialPosition(coin, session);
         success = true;
-        
+
         console.log(`✅ Successfully entered position for ${coin.symbol}`);
       } catch (error) {
         console.error(`❌ Failed to enter position for ${coin.symbol} (Attempt ${attempt}/${maxRetries}):`, error);
-        
+
         if (attempt < maxRetries) {
           const delay = Math.min(5000 * attempt, 30000); // Exponential backoff up to 30s
           console.log(`⏳ Retrying in ${delay / 1000} seconds...`);
@@ -241,7 +295,7 @@ export class TradingBot {
    */
   private async enterInitialPosition(coin: CoinConfig, session: MarketSession): Promise<void> {
     const marketData = this.dataProvider.getMarketData(coin.symbol);
-    
+
     if (!marketData) {
       throw new Error(`No market data available for ${coin.symbol}`);
     }
@@ -310,7 +364,7 @@ export class TradingBot {
       };
 
       await this.db.insertPosition(position);
-      
+
       await this.db.insertTrade({
         positionId: position.id,
         coin: coin.symbol,
@@ -329,9 +383,9 @@ export class TradingBot {
       });
 
       session.positionId = position.id;
-      
+
       console.log(`✅ Position opened: ${position.id}`);
-      
+
       // Start rebalancing loop
       this.startRebalancing(position, session);
     } else {
@@ -438,7 +492,7 @@ export class TradingBot {
     const action = decision.action;
     const shares = decision.shares!;
     const price = decision.targetPrice!;
-    
+
     const side = action.includes('UP') ? 'UP' : 'DOWN';
     const tokenId = side === 'UP' ? position.assetIds.up : position.assetIds.down;
     const cost = shares * price;
@@ -530,7 +584,7 @@ export class TradingBot {
 
   async stop(): Promise<void> {
     console.log('\n🛑 Stopping bot...');
-    
+
     this.running = false;
 
     // Clear all rebalance timers
@@ -540,12 +594,12 @@ export class TradingBot {
 
     await this.dataProvider.stop();
     this.polymarket.stop();
-    
+
     const stats = await this.getStats();
     console.log('\n📊 Final Stats:', stats);
-    
+
     await this.db.close();
-    
+
     console.log('\n✅ Bot stopped');
   }
 }
