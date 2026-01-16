@@ -1,5 +1,5 @@
 // ============================================================================
-// 1. CONFIG (src/config/index.ts)
+// UPDATED CONFIG (src/config/index.ts)
 // ============================================================================
 
 import dotenv from 'dotenv';
@@ -9,7 +9,6 @@ export interface CoinConfig {
   symbol: string;           // 'BTC', 'ETH', etc.
   ccxtSymbol: string;       // 'BTC/USDT'
   polymarketSlug: string;   // 'bitcoin-up-or-down'
-  minConfidence: number;    // Minimum confidence to trade
   enabled: boolean;
 }
 
@@ -36,17 +35,12 @@ export interface BotConfig {
     maxPositionSizeUSDC: number;
     minProfitThreshold: number;
     stopLossThreshold: number;
-    hedgeThreshold: number;
-    confidenceThresholds: {
-      high: number;
-      medium: number;
-      low: number;
-    };
   };
-  strategy: {
-    predictionLeadMinutes: number;
-    monitorIntervalSeconds: number;
-    klineIntervals: string[];
+  rebalancing: {
+    checkIntervalSeconds: number;
+    minImbalanceThreshold: number;
+    maxPriceSlippagePct: number;
+    aggressiveThresholdPct: number;
   };
   risk: {
     maxTotalExposure: number;
@@ -61,28 +55,24 @@ export const config: BotConfig = {
       symbol: 'BTC',
       ccxtSymbol: 'BTC/USDT',
       polymarketSlug: 'bitcoin-up-or-down',
-      minConfidence: 55,
       enabled: true,
     },
     {
       symbol: 'ETH',
       ccxtSymbol: 'ETH/USDT',
       polymarketSlug: 'ethereum-up-or-down',
-      minConfidence: 55,
       enabled: true,
     },
     {
       symbol: 'SOL',
       ccxtSymbol: 'SOL/USDT',
       polymarketSlug: 'solana-up-or-down',
-      minConfidence: 55,
       enabled: true,
     },
     {
       symbol: 'XRP',
       ccxtSymbol: 'XRP/USDT',
       polymarketSlug: 'xrp-up-or-down',
-      minConfidence: 55,
       enabled: true,
     },
   ],
@@ -98,7 +88,7 @@ export const config: BotConfig = {
   },
   ccxt: {
     exchange: 'binance',
-    enableRateLimit: false,
+    enableRateLimit: true,
     options: {
       defaultType: 'spot',
     },
@@ -107,17 +97,12 @@ export const config: BotConfig = {
     maxPositionSizeUSDC: 100,
     minProfitThreshold: 5,
     stopLossThreshold: 15,
-    hedgeThreshold: 8,
-    confidenceThresholds: {
-      high: 70,
-      medium: 60,
-      low: 50,
-    },
   },
-  strategy: {
-    predictionLeadMinutes: 5,
-    monitorIntervalSeconds: 10,
-    klineIntervals: ['1m', '5m', '15m', '1h'],
+  rebalancing: {
+    checkIntervalSeconds: 10,
+    minImbalanceThreshold: 10,
+    maxPriceSlippagePct: 5,
+    aggressiveThresholdPct: 50,
   },
   risk: {
     maxTotalExposure: 500,
@@ -125,3 +110,21 @@ export const config: BotConfig = {
     emergencyStopLoss: 25,
   },
 };
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'POLYMARKET_API_KEY',
+  'POLYMARKET_API_SECRET',
+  'POLYMARKET_API_PASSPHRASE',
+  'PRIVATE_KEY',
+  'DATABASE_URL',
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  throw new Error(
+    `Missing required environment variables: ${missingVars.join(', ')}\n` +
+    'Please check your .env file.'
+  );
+}

@@ -7,7 +7,7 @@ type PolymarketMessage = BookMessage | PriceChangeMessage;
 
 export class PolymarketWebSocket {
     private ws: WebSocket | null = null;
-    private readonly wsUrl = config.polymarket.wssUrl;
+    private readonly wsUrl = config.polymarket.wsUrl;
     private currentAssetId1: string | null = null;
     private currentAssetId2: string | null = null;
     private reconnectAttempts = 0;

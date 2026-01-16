@@ -52,12 +52,8 @@ export class PositionManager {
            totalExposure < this.config.risk.maxTotalExposure;
   }
 
-  calculatePositionSize(confidence: number): number {
+  calculatePositionSize(): number {
     const base = this.config.trading.maxPositionSizeUSDC;
-    const thresholds = this.config.trading.confidenceThresholds;
-
-    if (confidence >= thresholds.high) return base * 1.0;
-    if (confidence >= thresholds.medium) return base * 0.7;
     return base * 0.5;
   }
 
@@ -72,14 +68,6 @@ export class PositionManager {
     // Emergency stop loss
     if (!isWinning && Math.abs(priceMove) > this.config.risk.emergencyStopLoss) {
       return 'STOP_LOSS';
-    }
-
-    // Hedge when profitable
-    if (isWinning && Math.abs(priceMove) >= this.config.trading.hedgeThreshold) {
-      const hedgeProfit = this.calculateHedgeProfit(position, upPrice, downPrice);
-      if (hedgeProfit > position.shares * 0.05) {
-        return 'HEDGE';
-      }
     }
 
     // Stop loss near end if losing badly

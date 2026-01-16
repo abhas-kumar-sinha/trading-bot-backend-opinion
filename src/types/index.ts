@@ -1,5 +1,5 @@
 // ============================================================================
-// 2. TYPES (src/types/index.ts)
+// UPDATED TYPES (src/types/index.ts)
 // ============================================================================
 
 export interface OHLCV {
@@ -48,6 +48,7 @@ export interface Position {
   id: string;
   coin: string;
   marketId: string;
+  marketSlug: string;
   side: 'UP' | 'DOWN' | 'SKIP';
   entryPrice: number;
   shares: number;
@@ -66,6 +67,8 @@ export interface Position {
     down: string;
   };
   confidence: number;
+  upBalance?: number;
+  downBalance?: number;
 }
 
 export interface TradeSignal {
@@ -74,4 +77,22 @@ export interface TradeSignal {
   confidence: number;
   reasons: string[];
   marketData: MarketData;
+}
+
+export interface RebalanceDecision {
+  shouldRebalance: boolean;
+  action?: 'BUY_UP' | 'BUY_DOWN' | 'SELL_UP' | 'SELL_DOWN';
+  shares?: number;
+  targetPrice?: number;
+  currentImbalance: number;
+  reason: string;
+}
+
+export interface MarketSession {
+  coin: string;
+  market: PolymarketMarket;
+  positionId?: string;
+  startTime: number;
+  endTime: number;
+  active: boolean;
 }
