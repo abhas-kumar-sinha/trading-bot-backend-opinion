@@ -98,8 +98,8 @@ export class PolymarketClient {
           size: parseFloat(a.size) 
         })) || [];
 
-        const bestBid = bids[0]?.price || 0;
-        const bestAsk = asks[0]?.price || 1;
+        const bestBid = bids[bids.length - 1]?.price || 0;
+        const bestAsk = asks[asks.length - 1]?.price || 1;
 
         this.orderBooks.set(msg.asset_id, {
           assetId: msg.asset_id,

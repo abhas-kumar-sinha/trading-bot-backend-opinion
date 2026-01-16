@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { BotConfig, CoinConfig } from "../config";
-import { WebSocketDataProvider } from "../data/WebSocketDataProvider";
+import { BinanceWebSocketDataProvider } from "../data/WebSocketDataProvider";
 import { PolymarketClient } from "../polymarket/PolymarketClient";
 import { RebalancingEngine } from "../strategy/RebalancingEngine";
 import { DatabaseClient } from "../database/client";
@@ -12,7 +12,7 @@ import { DateTime } from 'luxon';
 
 export class TradingBot {
   private config: BotConfig;
-  private dataProvider: WebSocketDataProvider;
+  private dataProvider: BinanceWebSocketDataProvider;
   private polymarket: PolymarketClient;
   private rebalancingEngine: RebalancingEngine;
   private db: DatabaseClient;
@@ -23,7 +23,7 @@ export class TradingBot {
 
   constructor(config: BotConfig) {
     this.config = config;
-    this.dataProvider = new WebSocketDataProvider(config);
+    this.dataProvider = new BinanceWebSocketDataProvider(config);
     this.polymarket = new PolymarketClient(config);
     this.rebalancingEngine = new RebalancingEngine(config);
     this.db = new DatabaseClient();
@@ -165,7 +165,7 @@ export class TradingBot {
           } else {
             // Wait for orderbook data before entering
             await this.sleep(2000);
-            await this.enterInitialPosition(coin, session);
+            await this.enterInitialPositionWithRetry(coin, session);
           }
         }
       }
@@ -201,14 +201,49 @@ export class TradingBot {
   }
 
   /**
+   * Enter initial position with retry logic
+   */
+  private async enterInitialPositionWithRetry(
+    coin: CoinConfig,
+    session: MarketSession,
+    maxRetries: number = 10
+  ): Promise<void> {
+    let attempt = 0;
+    let success = false;
+
+    while (attempt < maxRetries && !success && this.running) {
+      attempt++;
+      
+      try {
+        console.log(`\n🎯 Attempting to enter position for ${coin.symbol} (Attempt ${attempt}/${maxRetries})`);
+        
+        await this.enterInitialPosition(coin, session);
+        success = true;
+        
+        console.log(`✅ Successfully entered position for ${coin.symbol}`);
+      } catch (error) {
+        console.error(`❌ Failed to enter position for ${coin.symbol} (Attempt ${attempt}/${maxRetries}):`, error);
+        
+        if (attempt < maxRetries) {
+          const delay = Math.min(5000 * attempt, 30000); // Exponential backoff up to 30s
+          console.log(`⏳ Retrying in ${delay / 1000} seconds...`);
+          await this.sleep(delay);
+        } else {
+          console.error(`🚫 Max retries reached for ${coin.symbol}. Giving up on this market.`);
+          session.active = false;
+        }
+      }
+    }
+  }
+
+  /**
    * Enter initial position at start of market
    */
   private async enterInitialPosition(coin: CoinConfig, session: MarketSession): Promise<void> {
     const marketData = this.dataProvider.getMarketData(coin.symbol);
     
     if (!marketData) {
-      console.log(`⚠️ ${coin.symbol}: No market data available`);
-      return;
+      throw new Error(`No market data available for ${coin.symbol}`);
     }
 
     const assetIds = JSON.parse(session.market.clobTokenIds);
@@ -218,8 +253,7 @@ export class TradingBot {
     const downBook = this.polymarket.getOrderBook(downAssetId);
 
     if (!upBook || !downBook) {
-      console.log(`⚠️ ${coin.symbol}: No orderbook data`);
-      return;
+      throw new Error(`No orderbook data for ${coin.symbol}`);
     }
 
     // Determine initial direction based on price momentum
@@ -227,13 +261,17 @@ export class TradingBot {
     const entryPrice = side === 'UP' ? upBook.bestAsk : downBook.bestAsk;
     const tokenId = side === 'UP' ? upAssetId : downAssetId;
 
+    // Validate entry price
+    if (entryPrice <= 0 || entryPrice >= 1) {
+      throw new Error(`Invalid entry price: ${entryPrice}`);
+    }
+
     // Calculate position size
     const sizeUSDC = this.config.trading.maxPositionSizeUSDC;
     const shares = Math.floor(sizeUSDC / entryPrice);
 
     if (shares < 1) {
-      console.log(`⚠️ ${coin.symbol}: Position too small`);
-      return;
+      throw new Error(`Position size too small: ${shares} shares`);
     }
 
     const costBasis = shares * entryPrice;
@@ -296,6 +334,8 @@ export class TradingBot {
       
       // Start rebalancing loop
       this.startRebalancing(position, session);
+    } else {
+      throw new Error('Failed to execute buy order');
     }
   }
 
