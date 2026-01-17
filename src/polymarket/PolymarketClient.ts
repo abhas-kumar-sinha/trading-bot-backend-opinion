@@ -12,7 +12,7 @@ import { PolymarketWebSocket } from './websocket';
 export class PolymarketClient {
   private clobClient: ClobClient;
   private gammaApiUrl: string;
-  private ws: PolymarketWebSocket;
+  private ws: PolymarketWebSocket | null = null;
   private marketAssetIds: Map<string, { assetId1: string; assetId2: string }> = new Map();
 
   constructor(config: BotConfig) {
@@ -30,7 +30,7 @@ export class PolymarketClient {
     );
 
     this.gammaApiUrl = config.polymarket.gammaApiUrl;
-    this.ws = new PolymarketWebSocket();
+    // Don't initialize WebSocket here - do it when we first subscribe
   }
 
   async start(): Promise<void> {
@@ -39,19 +39,37 @@ export class PolymarketClient {
   }
 
   /**
+   * Initialize or reinitialize the WebSocket connection
+   */
+  private initializeWebSocket(): void {
+    if (this.ws) {
+      console.log('🔄 Cleaning up existing WebSocket...');
+      this.ws.disconnect();
+      this.ws = null;
+    }
+    console.log('✨ Creating new WebSocket instance...');
+    this.ws = new PolymarketWebSocket();
+  }
+
+  /**
    * Subscribe to order books for a specific market's asset IDs
    */
   async subscribeToMarket(coin: string, assetId1: string, assetId2: string): Promise<boolean> {
     console.log(`📡 Subscribing to ${coin} market: ${assetId1.slice(0, 8)}..., ${assetId2.slice(0, 8)}...`);
 
+    // Initialize WebSocket if needed
+    if (!this.ws) {
+      this.initializeWebSocket();
+    }
+
     // Store the asset IDs for this coin
     this.marketAssetIds.set(coin, { assetId1, assetId2 });
 
     // Connect WebSocket with both asset IDs
-    this.ws.connect([assetId1, assetId2]);
+    this.ws!.connect([assetId1, assetId2]);
 
     // Wait for orderbook data to arrive
-    const success = await this.ws.waitForOrderbookData(assetId1, assetId2);
+    const success = await this.ws!.waitForOrderbookData(assetId1, assetId2);
     
     if (success) {
       console.log(`✅ ${coin} orderbook connected and ready`);
@@ -68,11 +86,16 @@ export class PolymarketClient {
   async subscribeToOrderBooks(assetId1: string, assetId2: string): Promise<boolean> {
     console.log(`📡 Subscribing to Polymarket pair: [${assetId1.slice(0, 8)}..., ${assetId2.slice(0, 8)}...]`);
 
+    // Initialize WebSocket if needed
+    if (!this.ws) {
+      this.initializeWebSocket();
+    }
+
     // Connect WebSocket with both asset IDs
-    this.ws.connect([assetId1, assetId2]);
+    this.ws!.connect([assetId1, assetId2]);
 
     // Wait for orderbook data to arrive
-    const success = await this.ws.waitForOrderbookData(assetId1, assetId2);
+    const success = await this.ws!.waitForOrderbookData(assetId1, assetId2);
     
     if (success) {
       console.log(`✅ Orderbook pair connected and ready`);
@@ -87,18 +110,20 @@ export class PolymarketClient {
    * Subscribe to multiple markets in pairs
    * Each market has 2 asset IDs (UP and DOWN tokens)
    * 
-   * CRITICAL: Polymarket's WebSocket replaces subscriptions on each call.
-   * Solution: Add all assets first, subscribe once, then wait for each pair's data
-   * 
-   * For market refresh: Completely reconnect the WebSocket with new assets
+   * CRITICAL: For market refresh, we create a completely new WebSocket instance
+   * to ensure clean state and avoid any corruption from old subscriptions
    */
   async subscribeInPairs(marketAssetPairs: Array<{ assetId1: string; assetId2: string; coin: string }>, isRefresh: boolean = false): Promise<void> {
     console.log(`📡 Subscribing to ${marketAssetPairs.length} Polymarket market pairs...`);
 
-    // Step 0: If this is a refresh, clear old market tracking
+    // Step 0: If this is a refresh, destroy old WebSocket and create new one
     if (isRefresh) {
-      console.log(`🔄 Market refresh detected - clearing old market data...`);
+      console.log(`🔄 Market refresh detected - creating fresh WebSocket instance...`);
       this.marketAssetIds.clear();
+      this.initializeWebSocket();
+    } else if (!this.ws) {
+      // First time initialization
+      this.initializeWebSocket();
     }
 
     // Step 1: Collect ALL asset IDs from all markets
@@ -108,14 +133,9 @@ export class PolymarketClient {
       allAssetIds.push(pair.assetId1, pair.assetId2);
     }
 
-    // Step 2: Connect to WebSocket - full reconnect if refresh
-    if (isRefresh) {
-      console.log(`📡 Performing full WebSocket reconnection with ${allAssetIds.length} new assets...`);
-      await this.ws.reconnect(allAssetIds);
-    } else {
-      console.log(`📡 Connecting to WebSocket with ${allAssetIds.length} total assets...`);
-      this.ws.connect(allAssetIds, false);
-    }
+    // Step 2: Connect to WebSocket with all assets at once
+    console.log(`📡 Connecting to WebSocket with ${allAssetIds.length} total assets...`);
+    this.ws!.connect(allAssetIds, false);
 
     // Step 3: Wait for each market pair's data sequentially
     for (let i = 0; i < marketAssetPairs.length; i++) {
@@ -124,7 +144,7 @@ export class PolymarketClient {
       
       // Wait for orderbook data for this specific pair
       console.log(`⏳ Waiting for ${pair.coin} orderbook data...`);
-      const success = await this.ws.waitForOrderbookData(pair.assetId1, pair.assetId2, 30000);
+      const success = await this.ws!.waitForOrderbookData(pair.assetId1, pair.assetId2, 30000);
 
       if (success) {
         console.log(`✅ ${pair.coin} orderbook ready (${i + 1}/${marketAssetPairs.length})`);
@@ -141,7 +161,7 @@ export class PolymarketClient {
    */
   unsubscribeFromMarket(coin: string): void {
     const assets = this.marketAssetIds.get(coin);
-    if (assets) {
+    if (assets && this.ws) {
       console.log(`📡 Unsubscribing from ${coin} market: ${assets.assetId1.slice(0, 8)}..., ${assets.assetId2.slice(0, 8)}...`);
       this.ws.unsubscribe([assets.assetId1, assets.assetId2]);
       this.marketAssetIds.delete(coin);
@@ -154,8 +174,10 @@ export class PolymarketClient {
    * Unsubscribe from specific pair of asset IDs
    */
   unsubscribeFromPair(assetId1: string, assetId2: string): void {
-    console.log(`📡 Unsubscribing from Polymarket pair: [${assetId1.slice(0, 8)}..., ${assetId2.slice(0, 8)}...]`);
-    this.ws.unsubscribe([assetId1, assetId2]);
+    if (this.ws) {
+      console.log(`📡 Unsubscribing from Polymarket pair: [${assetId1.slice(0, 8)}..., ${assetId2.slice(0, 8)}...]`);
+      this.ws.unsubscribe([assetId1, assetId2]);
+    }
   }
 
   async fetchMarket(slugPrefix: string, initial: boolean = true): Promise<PolymarketMarket | null> {
@@ -239,6 +261,10 @@ export class PolymarketClient {
    * Get order book data for a specific asset ID
    */
   getOrderBook(assetId: string): OrderBookData | null {
+    if (!this.ws) {
+      return null;
+    }
+
     const bookData = this.ws.getLatestBookByAssetId(assetId);
 
     if (!bookData) {
@@ -260,7 +286,10 @@ export class PolymarketClient {
   }
 
   stop(): void {
-    this.ws.disconnect();
+    if (this.ws) {
+      this.ws.disconnect();
+      this.ws = null;
+    }
     console.log('✅ Polymarket client stopped');
   }
 }

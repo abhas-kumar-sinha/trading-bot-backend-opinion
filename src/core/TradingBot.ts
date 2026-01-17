@@ -81,7 +81,11 @@ export class TradingBot {
           continue;
         }
 
-        const assetIds = JSON.parse(market.clobTokenIds);
+        const assetIds = market.clobTokenIds.match(/\d+/g);
+        if (!assetIds || assetIds.length < 2) {
+          console.log(`⚠️ ${coin.symbol}: Invalid clobTokenIds format: ${market.clobTokenIds}`);
+          continue;
+        }
         const [assetId1, assetId2] = assetIds;
 
         marketPairs.push({

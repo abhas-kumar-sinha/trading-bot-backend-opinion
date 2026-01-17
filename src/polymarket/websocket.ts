@@ -123,7 +123,7 @@ export class PolymarketWebSocket {
   /**
    * Wait for orderbook data to arrive for specific asset IDs
    */
-  public async waitForOrderbookData(assetId1: string, assetId2: string, timeoutMs: number = 30000): Promise<boolean> {
+  public async waitForOrderbookData(assetId1: string, assetId2: string, timeoutMs: number = 60000 * 5): Promise<boolean> {
     // Check if data already exists
     if (this.latestBookByAssetId.has(assetId1) && this.latestBookByAssetId.has(assetId2)) {
       console.log(`✅ Orderbook data already available for assets`);
