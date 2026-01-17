@@ -62,21 +62,5 @@ interface BookMessage {
     event_type: 'book';
 }
 
-interface PriceChange {
-    asset_id: string;
-    price: string;
-    size: string;
-    side: 'BUY' | 'SELL';
-    hash: string;
-    best_bid: string;
-    best_ask: string;
-}
 
-interface PriceChangeMessage {
-    market: string;
-    price_changes: PriceChange[];
-    timestamp: string;
-    event_type: 'price_change';
-}
-
-export { Market, OrderBookEntry, BookMessage, PriceChange, PriceChangeMessage };
+export { Market, OrderBookEntry, BookMessage };

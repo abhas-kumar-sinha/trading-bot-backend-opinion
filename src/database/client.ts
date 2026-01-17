@@ -396,7 +396,7 @@ export class DatabaseClient {
     const stats = await this.getStats();
     
     await this.query(
-      'UPDATE bot_sessions SET total_trades = $1, total_pnl = $2, updated_at = CURRENT_TIMESTAMP WHERE session_id = $3',
+      'UPDATE bot_sessions SET total_trades = $1, total_pnl = $2 WHERE session_id = $3',
       [stats.total_trades, stats.total_pnl, this.sessionId]
     );
   }

@@ -7,7 +7,7 @@ import { BinanceWebSocketDataProvider } from "../data/WebSocketDataProvider";
 import { PolymarketClient } from "../polymarket/PolymarketClient";
 import { RebalancingEngine } from "../strategy/RebalancingEngine";
 import { DatabaseClient } from "../database/client";
-import { OrderBookData, PolymarketMarket, Position, MarketSession } from "../types";
+import { PolymarketMarket, Position, MarketSession } from "../types";
 import { DateTime } from 'luxon';
 
 export class TradingBot {
@@ -25,7 +25,7 @@ export class TradingBot {
     this.config = config;
     this.dataProvider = new BinanceWebSocketDataProvider(config);
     this.polymarket = new PolymarketClient(config);
-    this.rebalancingEngine = new RebalancingEngine(config);
+    this.rebalancingEngine = new RebalancingEngine();
     this.db = new DatabaseClient();
   }
 
@@ -64,14 +64,14 @@ export class TradingBot {
    * Initialize markets and start trading workflow
    * Steps 3-6: Fetch markets → Extract IDs → Subscribe in pairs → Start trading
    */
-  private async initializeMarketsAndTrading(): Promise<void> {
+  private async initializeMarketsAndTrading(initial: boolean = true): Promise<void> {
     console.log('🔍 Step 3: Fetching active markets from Polymarket...');
 
     const marketPairs: Array<{ coin: string; market: PolymarketMarket; assetId1: string; assetId2: string; endTime: number }> = [];
 
     // Fetch all active markets
     for (const coin of this.config.coins.filter(c => c.enabled)) {
-      const market = await this.polymarket.fetchMarket(coin.polymarketSlug);
+      const market = await this.polymarket.fetchMarket(coin.polymarketSlug, initial);
 
       if (market && market.active) {
         const endTime = this.parseMarketEndTime(market.slug);
@@ -81,26 +81,20 @@ export class TradingBot {
           continue;
         }
 
-        const now = Date.now();
-        const timeUntilEnd = endTime - now;
+        const assetIds = JSON.parse(market.clobTokenIds);
+        const [assetId1, assetId2] = assetIds;
 
-        // Only process markets that end within the next 2 hours
-        if (timeUntilEnd > 0 && timeUntilEnd < 7200000) {
-          const assetIds = JSON.parse(market.clobTokenIds);
-          const [assetId1, assetId2] = assetIds;
+        marketPairs.push({
+          coin: coin.symbol,
+          market,
+          assetId1,
+          assetId2,
+          endTime
+        });
 
-          marketPairs.push({
-            coin: coin.symbol,
-            market,
-            assetId1,
-            assetId2,
-            endTime
-          });
-
-          console.log(`✅ ${coin.symbol}: ${market.question}`);
-          console.log(`   Ends at: ${new Date(endTime).toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`);
-          console.log(`   Asset IDs: [${assetId1}, ${assetId2}]`);
-        }
+        console.log(`✅ ${coin.symbol}: ${market.question}`);
+        console.log(`   Ends at: ${new Date(endTime).toLocaleString('en-US', { timeZone: 'America/New_York' })} ET`);
+        console.log(`   Asset IDs: [${assetId1}, ${assetId2}]`);
       }
     }
 
@@ -113,14 +107,14 @@ export class TradingBot {
 
     // STEP 5: Subscribe to Polymarket WebSocket in pairs (2 IDs at a time)
     console.log('\n📡 Step 5: Subscribing to Polymarket WebSocket in pairs...');
-    this.polymarket.subscribeInPairs(marketPairs.map(mp => ({
+    await this.polymarket.subscribeInPairs(marketPairs.map(mp => ({
       coin: mp.coin,
       assetId1: mp.assetId1,
       assetId2: mp.assetId2
     })));
 
     // Wait for orderbook data
-    await this.sleep(2000);
+    await this.sleep(5000);
 
     // STEP 6: Start trading
     console.log('\n🎯 Step 6: Starting trading logic...');
@@ -183,7 +177,7 @@ export class TradingBot {
       if (!this.running) return;
 
       console.log('\n🔄 Market refresh triggered - fetching new active markets...');
-      await this.initializeMarketsAndTrading();
+      await this.initializeMarketsAndTrading(false);
     }, delay);
   }
 
@@ -193,58 +187,76 @@ export class TradingBot {
 
   private parseMarketEndTime(slug: string): number | null {
     try {
-      // Example: bitcoin-up-or-down-january-16-6am-et
-      const parts = slug.split('-');
+      const parts = slug.toLowerCase().split('-');
 
-      // Find the month, day, and time
-      let month: string | null = null;
-      let day: number | null = null;
-      let hour: number | null = null;
-      let isPM = false;
+      // months array
+      const months = [
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december'
+      ];
 
+      let monthIndex: number | null = null;
+      let dayNum: number | null = null;
+      let hourNum: number | null = null;
+      let meridiem: 'am' | 'pm' | null = null;
+
+      // find month and day (day may be in same part or next part; supports '16' or '16th')
       for (let i = 0; i < parts.length; i++) {
-        const part = parts[i].toLowerCase();
+        const p = parts[i];
 
-        // Check for month names
-        const months = ['january', 'february', 'march', 'april', 'may', 'june',
-          'july', 'august', 'september', 'october', 'november', 'december'];
-        if (months.includes(part)) {
-          month = part;
-          if (i + 1 < parts.length && !isNaN(parseInt(parts[i + 1]))) {
-            day = parseInt(parts[i + 1]);
+        const mIdx = months.indexOf(p);
+        if (mIdx !== -1) {
+          monthIndex = mIdx;
+          // try next part for day
+          if (i + 1 < parts.length) {
+            const next = parts[i + 1].match(/\d+/);
+            if (next) dayNum = parseInt(next[0], 10);
           }
         }
 
-        // Check for time (e.g., "6am", "11pm")
-        if (part.endsWith('am') || part.endsWith('pm')) {
-          isPM = part.endsWith('pm');
-          hour = parseInt(part.replace(/[ap]m/, ''));
+        // Sometimes the month and day appear like "january-16" or "january-16th" - handled above.
+        // Also allow a standalone day anywhere (fallback)
+        if (dayNum === null) {
+          const dayMatch = p.match(/^(\d{1,2})(st|nd|rd|th)?$/);
+          if (dayMatch) dayNum = parseInt(dayMatch[1], 10);
+        }
+
+        // time like "6am", "11pm", "12pm"
+        const timeMatch = p.match(/^(\d{1,2})(am|pm)$/);
+        if (timeMatch) {
+          hourNum = parseInt(timeMatch[1], 10);
+          meridiem = timeMatch[2] as 'am' | 'pm';
         }
       }
 
-      if (!month || day === null || hour === null) {
+      if (monthIndex === null || dayNum === null || hourNum === null || meridiem === null) {
         return null;
       }
 
-      // Convert to actual end time (add 1 hour to start time)
-      let endHour = hour + 1;
-      if (endHour === 12 && !isPM) endHour = 12; // 11am -> 12pm
-      if (endHour === 13) { endHour = 1; isPM = true; } // 12pm -> 1pm
-      if (endHour === 24) endHour = 0; // 11pm -> 12am (midnight)
+      // convert start to 24-hour hour (0-23)
+      // 12am -> 0, 12pm -> 12, otherwise:
+      let start24 = hourNum % 12;
+      if (meridiem === 'pm') start24 += 12; // e.g., 1pm -> 13
 
-      // Build the end time in ET
+      // end hour in 24-hour space
+      const end24 = (start24 + 1) % 24;
+
+      // if end24 <= start24 then it rolled to the next day (e.g., 23 -> 0)
+      let endDay = dayNum;
+      if (end24 <= start24) {
+        endDay = dayNum + 1;
+      }
+
       const year = new Date().getFullYear();
-      const monthIndex = ['january', 'february', 'march', 'april', 'may', 'june',
-        'july', 'august', 'september', 'october', 'november', 'december']
-        .indexOf(month);
 
       const endTime = DateTime.fromObject({
         year,
         month: monthIndex + 1,
-        day,
-        hour: endHour + (isPM && endHour !== 12 ? 12 : 0) - (endHour === 12 && !isPM ? 12 : 0),
+        day: endDay,
+        hour: end24,
         minute: 0,
         second: 0,
+        millisecond: 0
       }, { zone: 'America/New_York' });
 
       return endTime.toMillis();
@@ -285,6 +297,9 @@ export class TradingBot {
         } else {
           console.error(`🚫 Max retries reached for ${coin.symbol}. Giving up on this market.`);
           session.active = false;
+
+          // Unsubscribe since we are giving up
+          this.polymarket.unsubscribeFromMarket(coin.symbol);
         }
       }
     }
@@ -323,10 +338,6 @@ export class TradingBot {
     // Calculate position size
     const sizeUSDC = this.config.trading.maxPositionSizeUSDC;
     const shares = Math.floor(sizeUSDC / entryPrice);
-
-    if (shares < 1) {
-      throw new Error(`Position size too small: ${shares} shares`);
-    }
 
     const costBasis = shares * entryPrice;
 
@@ -572,6 +583,9 @@ export class TradingBot {
     await this.db.updateSessionStats();
 
     session.active = false;
+
+    // Unsubscribe from this market's assets
+    this.polymarket.unsubscribeFromMarket(position.coin);
   }
 
   private sleep(ms: number): Promise<void> {

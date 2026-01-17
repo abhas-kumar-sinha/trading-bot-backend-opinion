@@ -3,15 +3,8 @@
 // ============================================================================
 
 import { MarketData, OrderBookData, Position, RebalanceDecision } from '../types';
-import { BotConfig } from '../config';
 
 export class RebalancingEngine {
-  private config: BotConfig;
-
-  constructor(config: BotConfig) {
-    this.config = config;
-  }
-
   /**
    * Evaluate if rebalancing is needed based on current position and market conditions
    */
