@@ -327,4 +327,50 @@ export class PolymarketWebSocket {
     this.reconnectAttempts = this.maxReconnectAttempts;
     this.cleanup();
   }
+
+  /**
+   * Full reconnection - disconnect completely and reconnect with new assets
+   * This is used during market refresh to get a clean slate
+   */
+  public async reconnect(newAssetIds: string[]): Promise<void> {
+    console.log('🔄 Performing full WebSocket reconnection...');
+    
+    // Step 1: Disconnect current connection
+    console.log('📡 Disconnecting current WebSocket...');
+    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
+    this.cleanup();
+    
+    // Step 2: Clear all old data
+    this.allSubscribedAssets.clear();
+    this.latestBookByAssetId.clear();
+    this.pendingDataPromises.forEach((promises) => {
+      promises.forEach(({ reject }) => {
+        reject(new Error('WebSocket reconnecting - old promises cancelled'));
+      });
+    });
+    this.pendingDataPromises.clear();
+    
+    // Step 3: Add new assets
+    newAssetIds.forEach(id => this.allSubscribedAssets.add(id));
+    
+    // Step 4: Wait a moment for clean disconnect
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Step 5: Reset reconnect attempts and establish new connection
+    this.reconnectAttempts = 0;
+    this.establishConnection();
+    
+    // Step 6: Wait for connection to be established
+    const maxWait = 10000; // 10 seconds
+    const startTime = Date.now();
+    while (!this.isConnected() && Date.now() - startTime < maxWait) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    if (!this.isConnected()) {
+      throw new Error('Failed to reconnect WebSocket');
+    }
+    
+    console.log('✅ WebSocket reconnected successfully');
+  }
 }

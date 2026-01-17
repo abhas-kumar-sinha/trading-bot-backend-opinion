@@ -90,7 +90,7 @@ export class PolymarketClient {
    * CRITICAL: Polymarket's WebSocket replaces subscriptions on each call.
    * Solution: Add all assets first, subscribe once, then wait for each pair's data
    * 
-   * For market refresh: Replace old subscriptions with new ones
+   * For market refresh: Completely reconnect the WebSocket with new assets
    */
   async subscribeInPairs(marketAssetPairs: Array<{ assetId1: string; assetId2: string; coin: string }>, isRefresh: boolean = false): Promise<void> {
     console.log(`📡 Subscribing to ${marketAssetPairs.length} Polymarket market pairs...`);
@@ -108,10 +108,14 @@ export class PolymarketClient {
       allAssetIds.push(pair.assetId1, pair.assetId2);
     }
 
-    // Step 2: Connect to WebSocket with ALL assets at once
-    // Use replaceExisting=true for refresh to clear old subscriptions
-    console.log(`📡 ${isRefresh ? 'Replacing old subscriptions with' : 'Connecting to WebSocket with'} ${allAssetIds.length} total assets...`);
-    this.ws.connect(allAssetIds, isRefresh);
+    // Step 2: Connect to WebSocket - full reconnect if refresh
+    if (isRefresh) {
+      console.log(`📡 Performing full WebSocket reconnection with ${allAssetIds.length} new assets...`);
+      await this.ws.reconnect(allAssetIds);
+    } else {
+      console.log(`📡 Connecting to WebSocket with ${allAssetIds.length} total assets...`);
+      this.ws.connect(allAssetIds, false);
+    }
 
     // Step 3: Wait for each market pair's data sequentially
     for (let i = 0; i < marketAssetPairs.length; i++) {
