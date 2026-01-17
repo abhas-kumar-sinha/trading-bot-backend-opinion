@@ -443,53 +443,68 @@ export class TradingBot {
     session: MarketSession,
     minutesRemaining: number
   ): Promise<void> {
-    // Fetch latest position from DB
-    const latestPosition = await this.db.getPosition(position.id);
-    if (!latestPosition) return;
+    try {
+      // Fetch latest position from DB
+      const latestPosition = await this.db.getPosition(position.id);
+      if (!latestPosition) return;
 
-    const marketData = this.dataProvider.getMarketData(position.coin);
-    if (!marketData) return;
+      const marketData = this.dataProvider.getMarketData(position.coin);
+      if (!marketData) return;
 
-    const upBook = this.polymarket.getOrderBook(position.assetIds.up);
-    const downBook = this.polymarket.getOrderBook(position.assetIds.down);
+      const upBook = this.polymarket.getOrderBook(position.assetIds.up);
+      const downBook = this.polymarket.getOrderBook(position.assetIds.down);
+      if (!upBook || !downBook) return;
 
-    if (!upBook || !downBook) return;
+      const decision = this.rebalancingEngine.evaluateRebalancing(
+        latestPosition,
+        marketData,
+        upBook,
+        downBook
+      );
 
-    // Evaluate rebalancing decision
-    const decision = this.rebalancingEngine.evaluateRebalancing(
-      latestPosition,
-      marketData,
-      upBook,
-      downBook
-    );
+      if (
+        decision.shouldRebalance &&
+        decision.action &&
+        decision.shares &&
+        decision.targetPrice
+      ) {
+        console.log(`\n⚖️ REBALANCING ${position.coin}`);
+        console.log(`   Action: ${decision.action}`);
+        console.log(`   Shares: ${decision.shares}`);
+        console.log(`   Target: $${decision.targetPrice.toFixed(4)}`);
+        console.log(`   Reason: ${decision.reason}`);
+        console.log(`   Time remaining: ${minutesRemaining}m`);
 
-    if (decision.shouldRebalance && decision.action && decision.shares && decision.targetPrice) {
-      console.log(`\n⚖️ REBALANCING ${position.coin}`);
-      console.log(`   Action: ${decision.action}`);
-      console.log(`   Shares: ${decision.shares}`);
-      console.log(`   Target: $${decision.targetPrice.toFixed(4)}`);
-      console.log(`   Reason: ${decision.reason}`);
-      console.log(`   Time remaining: ${minutesRemaining}m`);
+        await this.executeRebalanceTrade(
+          latestPosition,
+          decision,
+          marketData.price
+        );
+      }
 
-      await this.executeRebalanceTrade(latestPosition, decision, marketData.price);
+      // Save market snapshot
+      await this.db.insertSnapshot({
+        coin: position.coin,
+        marketSlug: session.market.slug,
+        price: marketData.price,
+        priceChange1m: marketData.priceChange1m,
+        priceChange5m: marketData.priceChange5m,
+        priceChange15m: marketData.priceChange15m,
+        volatility: marketData.volatility,
+        upBestBid: upBook.bestBid,
+        upBestAsk: upBook.bestAsk,
+        downBestBid: downBook.bestBid,
+        downBestAsk: downBook.bestAsk,
+        spread: upBook.spread + downBook.spread,
+        timestamp: Date.now(),
+      });
+
+    } catch (err: any) {
+      console.error(`🔥 Rebalancing error for ${position.coin}:`, err.message);
+
+      // IMPORTANT: swallow error so bot continues running
+      return;
     }
-
-    // Save market snapshot
-    await this.db.insertSnapshot({
-      coin: position.coin,
-      marketSlug: session.market.slug,
-      price: marketData.price,
-      priceChange1m: marketData.priceChange1m,
-      priceChange5m: marketData.priceChange5m,
-      priceChange15m: marketData.priceChange15m,
-      volatility: marketData.volatility,
-      upBestBid: upBook.bestBid,
-      upBestAsk: upBook.bestAsk,
-      downBestBid: downBook.bestBid,
-      downBestAsk: downBook.bestAsk,
-      spread: upBook.spread + downBook.spread,
-      timestamp: Date.now(),
-    });
   }
 
   /**
@@ -500,33 +515,33 @@ export class TradingBot {
     decision: any,
     currentPrice: number
   ): Promise<void> {
-    const action = decision.action;
-    const shares = decision.shares!;
-    const price = decision.targetPrice!;
+    try {
+      const action = decision.action;
+      const shares = decision.shares!;
+      const price = decision.targetPrice!;
 
-    const side = action.includes('UP') ? 'UP' : 'DOWN';
-    const tokenId = side === 'UP' ? position.assetIds.up : position.assetIds.down;
-    const cost = shares * price;
+      const side = action.includes('UP') ? 'UP' : 'DOWN';
+      const tokenId = side === 'UP'
+        ? position.assetIds.up
+        : position.assetIds.down;
 
-    // COMMENTED OUT - Real order execution
-    // const success = await this.polymarket.buyShares(tokenId, shares, price);
+      const cost = shares * price;
 
-    // Simulate success for database logging
-    const success = true;
+      const success = true;
 
-    // Update balances
-    const newUpBalance = (position.upBalance || 0) + (side === 'UP' ? shares : 0);
-    const newDownBalance = (position.downBalance || 0) + (side === 'DOWN' ? shares : 0);
+      const newUpBalance =
+        (position.upBalance || 0) + (side === 'UP' ? shares : 0);
+      const newDownBalance =
+        (position.downBalance || 0) + (side === 'DOWN' ? shares : 0);
 
-    if (success) {
-      // Update position in database
+      if (!success) return;
+
       await this.db.updatePosition(position.id, {
         upBalance: newUpBalance,
         downBalance: newDownBalance,
         costBasis: position.costBasis + cost,
       });
 
-      // Log trade
       await this.db.insertTrade({
         positionId: position.id,
         coin: position.coin,
@@ -541,16 +556,17 @@ export class TradingBot {
         downBalance: newDownBalance,
         imbalance: Math.abs(newUpBalance - newDownBalance),
         reason: decision.reason,
-        executed: false, // Set to false since real trading is commented out
+        executed: false,
       });
 
-      // Update in-memory position
       position.upBalance = newUpBalance;
       position.downBalance = newDownBalance;
       position.costBasis += cost;
 
       console.log(`✅ Rebalance executed`);
-      console.log(`   UP: ${newUpBalance} | DOWN: ${newDownBalance} | Imbalance: ${Math.abs(newUpBalance - newDownBalance)}`);
+    } catch (err: any) {
+      console.error(`❌ Rebalance trade failed:`, err.message);
+      return;
     }
   }
 

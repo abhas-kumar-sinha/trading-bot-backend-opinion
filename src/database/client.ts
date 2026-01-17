@@ -1,29 +1,74 @@
-// ============================================================================
-// DATABASE CLIENT (src/database/client.ts)
-// ============================================================================
-
+// src/database/client.ts
+import { EventEmitter } from 'events';
 import { Pool, PoolClient, QueryResult } from 'pg';
 import { Position } from '../types';
 
-export class DatabaseClient {
+type PendingOp = {
+  id: string;
+  type: 'query' | 'transaction';
+  payload: {
+    text?: string;
+    params?: any[];
+    // for transaction, callback will be set
+    callback?: (client: PoolClient) => Promise<any>;
+  };
+  resolve: (value: any) => void;
+  reject: (err: any) => void;
+  createdAt: number;
+};
+
+export class DatabaseClient extends EventEmitter {
   private pool: Pool;
   private sessionId: string;
+  private isHealthy: boolean = true;
+  private healthIntervalMs: number = 5000;
+  private healthTimer?: NodeJS.Timeout;
+  private reconnecting: boolean = false;
+  private reconnectAttempts: number = 0;
+  private maxReconnectAttempts: number = 20;
+  private pendingQueue: PendingOp[] = [];
+  private maxPendingQueueSize: number = 5000; // guard
+  private shuttingDown: boolean = false;
 
   constructor() {
-    this.pool = new Pool({
+    super();
+
+    this.pool = this.createPool();
+    this.sessionId = this.newSessionId();
+    // initialize schema + session; if this fails, constructor won't throw but will log and mark unhealthy
+    this.initializeSession().catch((err) => {
+      console.error('Initial DB setup failed:', err);
+      // start health check and reconnect loop
+      this.isHealthy = false;
+    });
+
+    // start periodic health check
+    this.startHealthCheck();
+  }
+
+  // -------------------------
+  // Pool creation & helpers
+  // -------------------------
+  private createPool(): Pool {
+    return new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
     });
-
-    this.sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    this.initializeSession();
   }
 
-   private async ensureSchema(): Promise<void> {
-   const schemaSQL = `
+  private newSessionId(): string {
+    return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  // -------------------------
+  // Schema & session init
+  // -------------------------
+  private async ensureSchema(poolToUse?: Pool): Promise<void> {
+    const pool = poolToUse ?? this.pool;
+    const schemaSQL = `
       -- Positions table
       CREATE TABLE IF NOT EXISTS positions (
       id VARCHAR(255) PRIMARY KEY,
@@ -106,25 +151,145 @@ export class DatabaseClient {
       CREATE INDEX IF NOT EXISTS idx_market_snapshots_coin_timestamp
       ON market_snapshots(coin, timestamp);
    `;
-
-      await this.pool.query(schemaSQL);
-      console.log('🗄️ Database schema ensured');
-   }
+    await pool.query(schemaSQL);
+  }
 
   private async initializeSession(): Promise<void> {
     try {
-      await this.ensureSchema();
+      await this.ensureSchema(this.pool);
       await this.pool.query(
         'INSERT INTO bot_sessions (session_id, status) VALUES ($1, $2)',
         [this.sessionId, 'ACTIVE']
       );
       console.log(`📊 Database session started: ${this.sessionId}`);
+      this.isHealthy = true;
+      this.emit('connected');
     } catch (error) {
       console.error('Failed to initialize session:', error);
+      this.isHealthy = false;
+      this.emit('disconnected', error);
+      // start reconnect attempts (health check loop will run)
     }
   }
 
-  async query(text: string, params?: any[]): Promise<QueryResult> {
+  // -------------------------
+  // Health checking & reconnect
+  // -------------------------
+  private startHealthCheck() {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = setInterval(async () => {
+      if (this.shuttingDown) return;
+      try {
+        await this.pool.query('SELECT 1');
+        if (!this.isHealthy) {
+          console.log('✅ Database connection restored (health check).');
+          this.isHealthy = true;
+          this.reconnectAttempts = 0;
+          await this.onReconnectSuccess();
+        }
+      } catch (err) {
+        if (this.isHealthy) {
+          console.error('⚠️ Database health check failed:', err);
+          this.isHealthy = false;
+          this.emit('disconnected', err);
+        }
+        // attempt reconnect loop if not currently reconnecting
+        if (!this.reconnecting) {
+          this.attemptReconnect().catch((e) => {
+            // attemptReconnect logs errors
+          });
+        }
+      }
+    }, this.healthIntervalMs);
+  }
+
+  private async attemptReconnect(): Promise<void> {
+    this.reconnecting = true;
+    this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, this.maxReconnectAttempts);
+
+    const backoffMs = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 60_000);
+    console.log(`🔁 Attempting DB reconnect (attempt ${this.reconnectAttempts}) in ${backoffMs}ms...`);
+
+    await this.delay(backoffMs);
+
+    if (this.shuttingDown) {
+      this.reconnecting = false;
+      return;
+    }
+
+    try {
+      // create a temporary pool to test the connection first
+      const testPool = this.createPool();
+      // ensure schema on test pool (this validates the connection and permissions)
+      await this.ensureSchema(testPool);
+      // if success, swap pools
+      const oldPool = this.pool;
+      this.pool = testPool;
+      this.sessionId = this.newSessionId();
+      await this.pool.query('INSERT INTO bot_sessions (session_id, status) VALUES ($1, $2)', [
+        this.sessionId,
+        'ACTIVE',
+      ]);
+      console.log(`🔌 Reconnected to DB and started new session ${this.sessionId}`);
+      this.isHealthy = true;
+      this.reconnectAttempts = 0;
+      this.emit('reconnected');
+      // close old pool gracefully
+      try {
+        await oldPool.end();
+      } catch (e) {
+        console.warn('Error closing old pool after reconnect:', e);
+      }
+      // process pending queue
+      await this.onReconnectSuccess();
+    } catch (err) {
+      console.error('Reconnect attempt failed:', err);
+      this.isHealthy = false;
+      // schedule next attempt via health check interval (reconnecting flag reset)
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  private async onReconnectSuccess(): Promise<void> {
+    // Process the pending queue (sequentially, preserving order)
+    if (this.pendingQueue.length === 0) {
+      return;
+    }
+    console.log(`📬 Processing ${this.pendingQueue.length} pending DB operations...`);
+    const queue = this.pendingQueue.splice(0); // take snapshot and clear queue
+    for (const item of queue) {
+      try {
+        if (item.type === 'query') {
+          const res = await this._immediateQuery(item.payload.text!, item.payload.params);
+          item.resolve(res);
+        } else if (item.type === 'transaction') {
+          try {
+            const val = await this._immediateTransaction(item.payload.callback!);
+            item.resolve(val);
+          } catch (txErr) {
+            item.reject(txErr);
+          }
+        } else {
+          item.reject(new Error('Unknown pending op type'));
+        }
+      } catch (err) {
+        // If execution fails even after reconnect, reject that op so caller knows
+        item.reject(err);
+      }
+    }
+    console.log('📬 Pending DB operations processed');
+  }
+
+  private delay(ms: number) {
+    return new Promise((res) => setTimeout(res, ms));
+  }
+
+  // -------------------------
+  // Query & Transaction APIs
+  // -------------------------
+  // internal immediate query that throws on failure
+  private async _immediateQuery(text: string, params?: any[]): Promise<QueryResult> {
     const client = await this.pool.connect();
     try {
       return await client.query(text, params);
@@ -133,21 +298,111 @@ export class DatabaseClient {
     }
   }
 
-  async transaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+  // public query API (queues when DB is unhealthy)
+  async query(text: string, params?: any[]): Promise<QueryResult> {
+    if (this.shuttingDown) {
+      throw new Error('DatabaseClient is shutting down');
+    }
+
+    if (this.isHealthy) {
+      try {
+        return await this._immediateQuery(text, params);
+      } catch (err) {
+        console.error('Query failed while healthy — marking unhealthy and queueing:', err);
+        // mark unhealthy and fallthrough to queue behavior
+        this.isHealthy = false;
+        this.emit('disconnected', err);
+        // start reconnect attempts
+        if (!this.reconnecting) {
+          this.attemptReconnect().catch(() => {});
+        }
+      }
+    }
+
+    // Queue the query and return a Promise that will resolve when processed
+    if (this.pendingQueue.length >= this.maxPendingQueueSize) {
+      throw new Error('Pending DB queue full — rejecting new query');
+    }
+
+    return new Promise<QueryResult>((resolve, reject) => {
+      const op: PendingOp = {
+        id: `q_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'query',
+        payload: { text, params },
+        resolve,
+        reject,
+        createdAt: Date.now(),
+      };
+      this.pendingQueue.push(op);
+      // ensure reconnect loop is running
+      if (!this.reconnecting) {
+        this.attemptReconnect().catch(() => {});
+      }
+    });
+  }
+
+  // internal immediate transaction (throws on failure)
+  private async _immediateTransaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const result = await callback(client);
       await client.query('COMMIT');
       return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rbErr) {
+        console.error('Rollback failed:', rbErr);
+      }
+      throw err;
     } finally {
       client.release();
     }
   }
 
+  // public transaction API
+  async transaction<T>(callback: (client: PoolClient) => Promise<T>): Promise<T> {
+    if (this.shuttingDown) {
+      throw new Error('DatabaseClient is shutting down');
+    }
+
+    if (this.isHealthy) {
+      try {
+        return await this._immediateTransaction(callback);
+      } catch (err) {
+        console.error('Transaction failed while healthy — marking unhealthy and queueing:', err);
+        this.isHealthy = false;
+        this.emit('disconnected', err);
+        if (!this.reconnecting) {
+          this.attemptReconnect().catch(() => {});
+        }
+      }
+    }
+
+    if (this.pendingQueue.length >= this.maxPendingQueueSize) {
+      throw new Error('Pending DB queue full — rejecting new transaction');
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      const op: PendingOp = {
+        id: `t_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'transaction',
+        payload: { callback },
+        resolve,
+        reject,
+        createdAt: Date.now(),
+      };
+      this.pendingQueue.push(op);
+      if (!this.reconnecting) {
+        this.attemptReconnect().catch(() => {});
+      }
+    });
+  }
+
+  // -------------------------
+  // Original operations (unchanged behavior)
+  // -------------------------
   // ========== POSITION OPERATIONS ==========
 
   async insertPosition(position: Position): Promise<void> {
@@ -219,7 +474,7 @@ export class DatabaseClient {
 
   async getPosition(id: string): Promise<Position | null> {
     const result = await this.query('SELECT * FROM positions WHERE id = $1', [id]);
-    
+
     if (result.rows.length === 0) return null;
 
     const row = result.rows[0];
@@ -231,7 +486,7 @@ export class DatabaseClient {
       'SELECT * FROM positions WHERE status = $1 ORDER BY entry_time DESC',
       ['OPEN']
     );
-    
+
     return result.rows.map(this.rowToPosition);
   }
 
@@ -240,7 +495,7 @@ export class DatabaseClient {
       'SELECT * FROM positions WHERE coin = $1 AND market_slug = $2 AND status = $3 ORDER BY entry_time DESC LIMIT 1',
       [coin, marketSlug, 'OPEN']
     );
-    
+
     if (result.rows.length === 0) return null;
     return this.rowToPosition(result.rows[0]);
   }
@@ -394,7 +649,7 @@ export class DatabaseClient {
 
   async updateSessionStats(): Promise<void> {
     const stats = await this.getStats();
-    
+
     await this.query(
       'UPDATE bot_sessions SET total_trades = $1, total_pnl = $2 WHERE session_id = $3',
       [stats.total_trades, stats.total_pnl, this.sessionId]
@@ -409,13 +664,22 @@ export class DatabaseClient {
   }
 
   async close(): Promise<void> {
-    await this.endSession();
-    await this.pool.end();
-    console.log('📊 Database connection closed');
+    this.shuttingDown = true;
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    try {
+      await this.endSession();
+    } catch (e) {
+      console.warn('Error ending session during close:', e);
+    }
+    try {
+      await this.pool.end();
+      console.log('📊 Database connection closed');
+    } catch (err) {
+      console.error('Error closing DB pool:', err);
+    }
   }
 
-  // ========== HEALTH CHECK ==========
-
+  // ========== HEALTH CHECK (public) ==========
   async healthCheck(): Promise<boolean> {
     try {
       await this.query('SELECT 1');
