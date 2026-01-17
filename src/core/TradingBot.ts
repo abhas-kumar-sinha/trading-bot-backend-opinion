@@ -111,7 +111,7 @@ export class TradingBot {
       coin: mp.coin,
       assetId1: mp.assetId1,
       assetId2: mp.assetId2
-    })));
+    })), !initial);
 
     // Wait for orderbook data
     await this.sleep(5000);

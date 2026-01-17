@@ -24,7 +24,23 @@ export class PolymarketWebSocket {
   /**
    * Connect to WebSocket and subscribe to assets
    */
-  public connect(assetIds: string[]): void {
+  public connect(assetIds: string[], replaceExisting: boolean = false): void {
+    // If replacing, clear existing assets first
+    if (replaceExisting) {
+      console.log(`🔄 Replacing ${this.allSubscribedAssets.size} existing assets with ${assetIds.length} new assets`);
+      
+      // Clear old subscriptions
+      this.allSubscribedAssets.clear();
+      
+      // Clear old orderbook data (but keep pending promises for new assets)
+      const newAssetSet = new Set(assetIds);
+      this.latestBookByAssetId.forEach((_, assetId) => {
+        if (!newAssetSet.has(assetId)) {
+          this.latestBookByAssetId.delete(assetId);
+        }
+      });
+    }
+
     // Add assets to our subscription set
     assetIds.forEach(id => this.allSubscribedAssets.add(id));
 
